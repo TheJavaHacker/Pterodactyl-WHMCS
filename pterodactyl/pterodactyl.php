@@ -3,7 +3,7 @@
 /**
 MIT License
 
-Copyright (c) 2018 Stepan Fedotov <stepan@crident.com>
+Copyright (c) 2018-2019 Stepan Fedotov <stepan@crident.com>
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -32,11 +32,20 @@ use Illuminate\Database\Capsule\Manager as Capsule;
 
 function pterodactyl_GetHostname(array $params) {
     $hostname = $params['serverhostname'];
+    if ($hostname === '') throw new Exception('Could not find the panel\'s hostname - did you configure server group for the product?');
+
+    // For whatever reason, WHMCS converts some characters of the hostname to their literal meanings (- => dash, etc) in some cases
+    foreach([
+        'DOT' => '.',
+        'DASH' => '-',
+    ] as $from => $to) {
+        $hostname = str_replace($from, $to, $hostname);
+    }
+
     if(ip2long($hostname) !== false) $hostname = 'http://' . $hostname;
+    else $hostname = ($params['serversecure'] ? 'https://' : 'http://') . $hostname;
 
-    if(substr($hostname, -1) === '/') return substr($hostname, 0, strlen($hostname) - 1);
-
-    return $hostname;
+    return rtrim($hostname, '/');
 }
 
 function pterodactyl_API(array $params, $endpoint, array $data = [], $method = "GET", $dontLog = false) {
@@ -49,6 +58,7 @@ function pterodactyl_API(array $params, $endpoint, array $data = [], $method = "
     curl_setopt($curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
     curl_setopt($curl, CURLOPT_USERAGENT, "Pterodactyl-WHMCS");
     curl_setopt($curl, CURLOPT_FOLLOWLOCATION, 1);
+    curl_setopt($curl, CURLOPT_POSTREDIR, CURL_REDIR_POST_301);
     curl_setopt($curl, CURLOPT_TIMEOUT, 5);
 
     $headers = [
@@ -150,7 +160,7 @@ function pterodactyl_ConfigOptions() {
         ],
         "pack_id" => [
             "FriendlyName" => "Pack ID",
-            "Description" => "ID of the Pack to install the server with (optional)",
+            "Description" => "ID of the Pack to install the server with (optional) [UNUSED, LEFT FOR COMPATIBILITY REASONS]",
             "Type" => "text",
             "Size" => 10,
         ],
@@ -178,18 +188,35 @@ function pterodactyl_ConfigOptions() {
             "Type" => "text",
             "Size" => 10,
         ],
-	"server_name" => [
+    	"server_name" => [
             "FriendlyName" => "Server Name",
             "Description" => "The name of the server as shown on the panel (optional)",
             "Type" => "text",
             "Size" => 25,
+        ],
+        "oom_disabled" => [
+            "FriendlyName" => "Disable OOM Killer",
+            "Description" => "Should the Out Of Memory Killer be disabled (optional)",
+            "Type" => "yesno",
+        ],
+        "backups" => [
+            "FriendlyName" => "Backups",
+            "Description" => "Client will be able to create this amount of backups for their server (optional)",
+            "Type" => "text",
+            "Size" => 10,
+        ],
+        "allocations" => [
+            "FriendlyName" => "Allocations",
+            "Description" => "Client will be able to create this amount of allocations for their server (optional)",
+            "Type" => "text",
+            "Size" => 10,
         ],
     ];
 }
 
 function pterodactyl_TestConnection(array $params) {
     $solutions = [
-        0 => "Most likely hostname is configured wrong causing the request never get executed.",
+        0 => "Check module debug log for more detailed error.",
         401 => "Authorization header either missing or not provided.",
         403 => "Double check the password (which should be the Application Key).",
         404 => "Result not found.",
@@ -221,10 +248,20 @@ function pterodactyl_TestConnection(array $params) {
     ];
 }
 
+function random($length) {
+    if (class_exists("\Illuminate\Support\Str")) {
+        return \Illuminate\Support\Str::random($length);
+    } else if (function_exists("str_random")) {
+        return str_random($length);
+    } else {
+        throw new \Exception("Unable to find a valid function for generating random strings");
+    }
+}
+
 function pterodactyl_GenerateUsername($length = 8) {
     $returnable = false;
     while (!$returnable) {
-        $generated = str_random($length);
+        $generated = random($length);
         if (preg_match('/[A-Z]+[a-z]+[0-9]+/', $generated)) {
             $returnable = true;
         }
@@ -270,10 +307,10 @@ function pterodactyl_CreateAccount(array $params) {
 
         $userResult = pterodactyl_API($params, 'users/external/' . $params['clientsdetails']['id']);
         if($userResult['status_code'] === 404) {
-            $userResult = pterodactyl_API($params, 'users?search=' . urlencode($params['clientsdetails']['email']));
+            $userResult = pterodactyl_API($params, 'users?filter[email]=' . urlencode($params['clientsdetails']['email']));
             if($userResult['meta']['pagination']['total'] === 0) {
                 $userResult = pterodactyl_API($params, 'users', [
-                    'username' => pterodactyl_GenerateUsername(),
+                    'username' => pterodactyl_GetOption($params, 'username', pterodactyl_GenerateUsername()),
                     'email' => $params['clientsdetails']['email'],
                     'first_name' => $params['clientsdetails']['firstname'],
                     'last_name' => $params['clientsdetails']['lastname'],
@@ -321,7 +358,6 @@ function pterodactyl_CreateAccount(array $params) {
         $io = pterodactyl_GetOption($params, 'io');
         $cpu = pterodactyl_GetOption($params, 'cpu');
         $disk = pterodactyl_GetOption($params, 'disk');
-        $pack_id = pterodactyl_GetOption($params, 'pack_id');
         $location_id = pterodactyl_GetOption($params, 'location_id');
         $dedicated_ip = pterodactyl_GetOption($params, 'dedicated_ip') ? true : false;
         $port_range = pterodactyl_GetOption($params, 'port_range');
@@ -329,7 +365,9 @@ function pterodactyl_CreateAccount(array $params) {
         $image = pterodactyl_GetOption($params, 'image', $eggData['attributes']['docker_image']);
         $startup = pterodactyl_GetOption($params, 'startup', $eggData['attributes']['startup']);
         $databases = pterodactyl_GetOption($params, 'databases');
-        $allocations = pterodactyl_GetOption($params, 'options');
+        $allocations = pterodactyl_GetOption($params, 'allocations');
+        $backups = pterodactyl_GetOption($params, 'backups');
+        $oom_disabled = pterodactyl_GetOption($params, 'oom_disabled') ? true : false;
         $serverData = [
             'name' => $name,
             'user' => (int) $userId,
@@ -337,6 +375,7 @@ function pterodactyl_CreateAccount(array $params) {
             'egg' => (int) $eggId,
             'docker_image' => $image,
             'startup' => $startup,
+            'oom_disabled' => $oom_disabled,
             'limits' => [
                 'memory' => (int) $memory,
                 'swap' => (int) $swap,
@@ -347,6 +386,7 @@ function pterodactyl_CreateAccount(array $params) {
             'feature_limits' => [
                 'databases' => $databases ? (int) $databases : null,
                 'allocations' => (int) $allocations,
+                'backups' => (int) $backups,
             ],
             'deploy' => [
                 'locations' => [(int) $location_id],
@@ -357,12 +397,17 @@ function pterodactyl_CreateAccount(array $params) {
             'start_on_completion' => true,
             'external_id' => (string) $params['serviceid'],
         ];
-        if(isset($pack_id)) $serverData['pack'] = (int) $pack_id;
 
         $server = pterodactyl_API($params, 'servers', $serverData, 'POST');
 
         if($server['status_code'] === 400) throw new Exception('Couldn\'t find any nodes satisfying the request.');
         if($server['status_code'] !== 201) throw new Exception('Failed to create the server, received the error code: ' . $server['status_code'] . '. Enable module debug log for more info.');
+
+        unset($params['password']);
+        Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
+            'username' => '',
+            'password' => '',
+        ]);
     } catch(Exception $err) {
         return $err->getMessage();
     }
@@ -376,6 +421,8 @@ function pterodactyl_GetServerID(array $params, $raw = false) {
     if($serverResult['status_code'] === 200) {
         if($raw) return $serverResult;
         else return $serverResult['attributes']['id'];
+    } else if($serverResult['status_code'] === 500) {
+        throw new Exception('Failed to get server, panel errored. Check panel logs for more info.');
     }
 
     if(Capsule::schema()->hasTable('tbl_pterodactylproduct')) {
@@ -440,7 +487,30 @@ function pterodactyl_TerminateAccount(array $params) {
 
 function pterodactyl_ChangePassword(array $params) {
     try {
-        throw new Exception('Not implemented, don\'t see need for this.');
+        if($params['password'] === '') throw new Exception('The password cannot be empty.');
+
+        $serverData = pterodactyl_GetServerID($params, true);
+        if(!isset($serverData)) throw new Exception('Failed to change password because linked server doesn\'t exist.');
+
+        $userId = $serverData['attributes']['user'];
+        $userResult = pterodactyl_API($params, 'users/' . $userId);
+        if($userResult['status_code'] !== 200) throw new Exception('Failed to retrieve user, received error code: ' . $userResult['status_code'] . '.');
+
+        $updateResult = pterodactyl_API($params, 'users/' . $serverData['attributes']['user'], [
+            'username' => $userResult['attributes']['username'],
+            'email' => $userResult['attributes']['email'],
+            'first_name' => $userResult['attributes']['first_name'],
+            'last_name' => $userResult['attributes']['last_name'],
+
+            'password' => $params['password'],
+        ], 'PATCH');
+        if($updateResult['status_code'] !== 200) throw new Exception('Failed to change password, received error code: ' . $updateResult['status_code'] . '.');
+
+        unset($params['password']);
+        Capsule::table('tblhosting')->where('id', $params['serviceid'])->update([
+            'username' => '',
+            'password' => '',
+        ]);
     } catch(Exception $err) {
         return $err->getMessage();
     }
@@ -460,7 +530,9 @@ function pterodactyl_ChangePackage(array $params) {
         $cpu = pterodactyl_GetOption($params, 'cpu');
         $disk = pterodactyl_GetOption($params, 'disk');
         $databases = pterodactyl_GetOption($params, 'databases');
-        $allocations = pterodactyl_GetOption($params, 'options');
+        $allocations = pterodactyl_GetOption($params, 'allocations');
+        $backups = pterodactyl_GetOption($params, 'backups');
+        $oom_disabled = pterodactyl_GetOption($params, 'oom_disabled') ? true : false;
         $updateData = [
             'allocation' => $serverData['attributes']['allocation'],
             'memory' => (int) $memory,
@@ -468,9 +540,11 @@ function pterodactyl_ChangePackage(array $params) {
             'io' => (int) $io,
             'cpu' => (int) $cpu,
             'disk' => (int) $disk,
+            'oom_disabled' => $oom_disabled,
             'feature_limits' => [
                 'databases' => (int) $databases,
                 'allocations' => (int) $allocations,
+                'backups' => (int) $backups,
             ],
         ];
 
@@ -479,7 +553,6 @@ function pterodactyl_ChangePackage(array $params) {
 
         $nestId = pterodactyl_GetOption($params, 'nest_id');
         $eggId = pterodactyl_GetOption($params, 'egg_id');
-        $pack_id = pterodactyl_GetOption($params, 'pack_id');
         $eggData = pterodactyl_API($params, 'nests/' . $nestId . '/eggs/' . $eggId . '?include=variables');
         if($eggData['status_code'] !== 200) throw new Exception('Failed to get egg data, received error code: ' . $eggData['status_code'] . '. Enable module debug log for more info.');
 
@@ -502,9 +575,8 @@ function pterodactyl_ChangePackage(array $params) {
             'environment' => $environment,
             'startup' => $startup,
             'egg' => (int) $eggId,
-            'pack' => (int) $pack_id,
             'image' => $image,
-            'skip_scripts' => true,
+            'skip_scripts' => false,
         ];
 
         $updateResult = pterodactyl_API($params, 'servers/' . $serverId . '/startup', $updateData, 'PATCH');
@@ -525,7 +597,7 @@ function pterodactyl_LoginLink(array $params) {
 
         $hostname = pterodactyl_GetHostname($params);
         echo '[<a href="'.$hostname.'/admin/servers/view/' . $serverId . '" target="_blank">Go to Service</a>]';
-        echo '<p style="float: right">[<a href="https://github.com/TrixterTheTux/Pterodactyl-WHMCS/issues" target="_blank">Report A Bug</a>]</p>';
+        echo '<p style="float: right">[<a href="https://github.com/pterodactyl/whmcs/issues" target="_blank">Report A Bug</a>]</p>';
     } catch(Exception $err) {
         // Ignore
     }
@@ -535,10 +607,14 @@ function pterodactyl_ClientArea(array $params) {
     if($params['moduletype'] !== 'pterodactyl') return;
 
     try {
-        $serverData = pterodactyl_GetServerID($params, true);
-        if($serverData['status_code'] === 404 || !isset($serverData['attributes']['id'])) return;
-
         $hostname = pterodactyl_GetHostname($params);
+        $serverData = pterodactyl_GetServerID($params, true);
+        if($serverData['status_code'] === 404 || !isset($serverData['attributes']['id'])) return [
+            'templatefile' => 'clientarea',
+            'vars' => [
+                'serviceurl' => $hostname,
+            ],
+        ];
 
         return [
             'templatefile' => 'clientarea',
